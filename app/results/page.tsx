@@ -4,7 +4,7 @@ import { useState, useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { QAExchange, ScreenAnalysis, ScoreBreakdown } from "@/types";
 import { RUBRIC } from "@/lib/rubric";
-import { Loader2, AlertCircle, Download, FileText, ArrowLeft, CheckCircle2, XCircle } from "lucide-react";
+import { Loader2, AlertCircle, Download, FileText, ArrowLeft, CheckCircle2, XCircle, Clock, LayoutTemplate, MessageSquare, Hash } from "lucide-react";
 
 const getScoreLabel = (score: number) => {
   if (score >= 90) return "Excellent";
@@ -113,6 +113,7 @@ Return ONLY valid JSON with this exact shape (no markdown fences, just the raw J
     "originality": number (0-100),
     "understanding": number (0-100)
   },
+  "topics_covered": ["string"],
   "per_question_feedback": [
     {
       "question": "string",
@@ -179,6 +180,11 @@ Return ONLY valid JSON with this exact shape (no markdown fences, just the raw J
       md += `- ${label}: ${score}/100\n`;
     });
     md += `\n`;
+
+    if (result.topics_covered && result.topics_covered.length > 0) {
+      md += `### Topics Covered\n`;
+      md += `${result.topics_covered.map(t => `- ${t}`).join("\n")}\n\n`;
+    }
 
     md += `### Overall Feedback\n`;
     md += `#### Strengths\n${result.overall_feedback.strengths.map(s => `- ${s}`).join("\n")}\n\n`;
@@ -313,6 +319,41 @@ Return ONLY valid JSON with this exact shape (no markdown fences, just the raw J
           <p className="text-sm text-gray-500 mt-2">{new Date().toLocaleDateString()}</p>
         </div>
 
+        {/* Session Summary Card */}
+        {interviewDataRef.current && interviewDataRef.current.history.length > 0 && (
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-12">
+            <div className="bg-card border border-border p-4 rounded-xl flex items-center gap-4 shadow-sm">
+              <div className="bg-blue-500/10 text-blue-500 p-3 rounded-lg shrink-0">
+                <MessageSquare className="w-5 h-5" />
+              </div>
+              <div>
+                <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-0.5">Questions</p>
+                <p className="text-xl font-bold">{interviewDataRef.current.history.length}</p>
+              </div>
+            </div>
+            <div className="bg-card border border-border p-4 rounded-xl flex items-center gap-4 shadow-sm">
+              <div className="bg-orange-500/10 text-orange-500 p-3 rounded-lg shrink-0">
+                <Clock className="w-5 h-5" />
+              </div>
+              <div>
+                <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-0.5">Duration</p>
+                <p className="text-xl font-bold">
+                  {Math.max(1, Math.round((interviewDataRef.current.history[interviewDataRef.current.history.length - 1].timestamp - interviewDataRef.current.history[0].timestamp) / 60000))} mins
+                </p>
+              </div>
+            </div>
+            <div className="bg-card border border-border p-4 rounded-xl flex items-center gap-4 shadow-sm">
+              <div className="bg-purple-500/10 text-purple-500 p-3 rounded-lg shrink-0">
+                <LayoutTemplate className="w-5 h-5" />
+              </div>
+              <div>
+                <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-0.5">Screen Contexts</p>
+                <p className="text-xl font-bold">{interviewDataRef.current.analyses.length}</p>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Hero Score Section */}
         <section className="flex flex-col md:flex-row items-center gap-12 justify-center">
           <div className="relative w-48 h-48 flex items-center justify-center print:w-32 print:h-32">
@@ -379,6 +420,25 @@ Return ONLY valid JSON with this exact shape (no markdown fences, just the raw J
             </div>
           </div>
         </section>
+
+        {/* Topic Coverage Tracker */}
+        {result.topics_covered && result.topics_covered.length > 0 && (
+          <section className="bg-card border border-border rounded-xl p-6 shadow-sm print:border print:border-gray-300">
+            <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wider mb-4 flex items-center gap-2">
+              <Hash className="w-4 h-4" /> Topics Covered
+            </h3>
+            <div className="flex flex-wrap gap-2">
+              {result.topics_covered.map((topic, i) => (
+                <span 
+                  key={i} 
+                  className="bg-secondary/50 text-secondary-foreground px-3 py-1.5 rounded-full text-sm font-medium border border-border print:border-gray-300 print:bg-transparent print:text-black"
+                >
+                  {topic}
+                </span>
+              ))}
+            </div>
+          </section>
+        )}
 
         {/* Overall Feedback */}
         <section className="grid md:grid-cols-3 gap-6 print:grid-cols-3 print:break-inside-avoid print:gap-4">

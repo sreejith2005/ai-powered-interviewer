@@ -12,6 +12,7 @@ export default function SetupPage() {
   const [testResult, setTestResult] = useState<{ status: "idle" | "success" | "error"; message: string }>({ status: "idle", message: "" });
   const [isStarting, setIsStarting] = useState(false);
   const [errorMsg, setErrorMsg] = useState("");
+  const [targetQuestions, setTargetQuestions] = useState(5);
 
   // Mic test state
   const [micTestStatus, setMicTestStatus] = useState<"idle" | "testing" | "success" | "error">("idle");
@@ -127,6 +128,7 @@ export default function SetupPage() {
     try {
       sessionStorage.setItem("gemini_api_key", apiKey);
       sessionStorage.setItem("project_context", projectContext);
+      sessionStorage.setItem("target_questions", targetQuestions.toString());
       router.push("/interview");
     } catch (err: any) {
       console.error("Navigation error:", err);
@@ -279,6 +281,23 @@ export default function SetupPage() {
                 placeholder="e.g. A Next.js dashboard for managing remote teams. Built with Tailwind and Supabase..."
                 className="flex min-h-[120px] w-full rounded-md border border-input bg-background px-3 py-3 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-50 resize-y transition-shadow"
               />
+            </div>
+
+            {/* Target Questions Section */}
+            <div className="flex flex-col gap-3">
+              <label htmlFor="target-questions" className="text-sm font-medium">
+                Interview Length
+              </label>
+              <select
+                id="target-questions"
+                value={targetQuestions}
+                onChange={(e) => setTargetQuestions(Number(e.target.value))}
+                className="flex w-full rounded-md border border-input bg-background px-3 py-2.5 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary transition-shadow"
+              >
+                <option value={3}>3 Questions (Short)</option>
+                <option value={5}>5 Questions (Standard)</option>
+                <option value={8}>8 Questions (In-depth)</option>
+              </select>
             </div>
 
             {errorMsg && (

@@ -8,12 +8,14 @@ export interface ScreenAnalysis {
   timestamp: number;
   extractedText?: string;
   visualContext?: string;
+  contentType?: string;
 }
 
 export interface QAExchange {
   id: string;
   timestamp: number;
   question: string;
+  rationale?: string;
   answer: string;
   expected_points?: string[];
   aiFeedback?: string;
@@ -42,6 +44,14 @@ export interface ScoreBreakdown {
     originality: number;
     understanding: number;
   };
+  topics_covered?: string[];
   per_question_feedback: PerQuestionFeedback[];
   overall_feedback: OverallFeedback;
+}
+
+export interface ActivityEvent {
+  id: string;
+  type: 'system' | 'analysis' | 'question' | 'answer';
+  timestamp: number;
+  content: string;
 }

@@ -2,8 +2,8 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
-import { Mic, Video, MicOff, AlertCircle, Loader2, Eye, EyeOff, Volume2, VolumeX, MessageSquare } from "lucide-react";
-import { QAExchange, ScreenAnalysis } from "@/types";
+import { Mic, Video, MicOff, AlertCircle, Loader2, Eye, EyeOff, Volume2, VolumeX, MessageSquare, Brain, Clock, ChevronDown, ChevronUp, Flag, Target } from "lucide-react";
+import { QAExchange, ScreenAnalysis, ActivityEvent } from "@/types";
 
 // Type definitions for Web Speech API
 declare global {
@@ -26,22 +26,27 @@ export default function InterviewPage() {
   const [projectContext, setProjectContext] = useState("");
   
   // Interview state
-  const [currentQuestion, setCurrentQuestion] = useState<{ question: string; expected_points?: string[] } | null>(null);
+  const [currentQuestion, setCurrentQuestion] = useState<{ question: string; expected_points?: string[]; rationale?: string } | null>(null);
   const [history, setHistory] = useState<QAExchange[]>([]);
   const [screenAnalyses, setScreenAnalyses] = useState<ScreenAnalysis[]>([]);
+  const [targetQuestions, setTargetQuestions] = useState(5);
+  const [activityLog, setActivityLog] = useState<ActivityEvent[]>([]);
   
   // UX state
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isGeneratingNext, setIsGeneratingNext] = useState(false);
+  const [showReasoning, setShowReasoning] = useState(false);
   
   // Modals & transient errors
   const [showEndConfirm, setShowEndConfirm] = useState(false);
   const [showScreenStopModal, setShowScreenStopModal] = useState(false);
+  const [showTargetReachedModal, setShowTargetReachedModal] = useState(false);
   const [sttError, setSttError] = useState("");
   
   // TTS State
   const [ttsEnabled, setTtsEnabled] = useState(true);
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
 
   // STT State
   const [isListening, setIsListening] = useState(false);
@@ -60,6 +65,7 @@ export default function InterviewPage() {
     document.title = "Interview in Progress | AI Interviewer";
     const key = sessionStorage.getItem("gemini_api_key");
     const ctx = sessionStorage.getItem("project_context") || "";
+    const targetQ = sessionStorage.getItem("target_questions");
     
     if (!key) {
       router.push("/");
@@ -68,6 +74,7 @@ export default function InterviewPage() {
     
     setApiKey(key);
     setProjectContext(ctx);
+    if (targetQ) setTargetQuestions(Number(targetQ));
 
     // Check Speech Recognition support
     if (typeof window !== "undefined") {
@@ -101,6 +108,15 @@ export default function InterviewPage() {
         recognitionRef.current.onend = () => {
           setIsListening(false);
         };
+      }
+
+      // Load TTS Voices
+      const loadVoices = () => {
+        setVoices(window.speechSynthesis.getVoices());
+      };
+      loadVoices();
+      if (window.speechSynthesis.onvoiceschanged !== undefined) {
+        window.speechSynthesis.onvoiceschanged = loadVoices;
       }
     }
 
@@ -221,19 +237,30 @@ export default function InterviewPage() {
     try {
       const data = await fetchGeminiWithRetry({
         apiKey,
-        prompt: "Briefly describe what's currently visible on this screen (e.g. code, UI, slides). Keep it to 2-3 sentences. Focus on the main content.",
+        prompt: "Briefly describe what's currently visible on this screen (e.g. code, UI, slides). Keep it to 2-3 sentences. Focus on the main content. Return ONLY valid JSON in this format: { \"description\": \"your description\", \"contentType\": \"code\" | \"UI\" | \"slides\" | \"terminal\" | \"browser\" | \"unclear\" }",
         imageBase64: frameBase64,
       });
 
+      let description = data.text;
+      let contentType = "unclear";
+      try {
+        const jsonStr = data.text.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+        const parsed = JSON.parse(jsonStr);
+        description = parsed.description || description;
+        contentType = parsed.contentType || "unclear";
+      } catch (e) {
+        console.warn("Could not parse analyzeScreen JSON", e);
+      }
+
       const analysis: ScreenAnalysis = {
         timestamp: Date.now(),
-        visualContext: data.text,
+        visualContext: description,
+        contentType: contentType,
       };
       
-      setScreenAnalyses(prev => {
-        const updated = [...prev, analysis];
-        return updated.slice(-4); // Keep last 4
-      });
+      setScreenAnalyses(prev => [...prev, analysis]);
+
+      setActivityLog(prev => [...prev, { id: Date.now().toString() + Math.random(), type: 'analysis', timestamp: Date.now(), content: description }]);
     } catch (err) {
       console.error("Screen analysis error:", err);
     } finally {
@@ -252,12 +279,33 @@ export default function InterviewPage() {
     window.speechSynthesis.cancel(); // cancel any ongoing speech
     const utterance = new SpeechSynthesisUtterance(text);
     
+    if (voices.length > 0) {
+      // Prefer natural sounding English voices
+      const preferred = voices.find(v => v.lang.startsWith('en') && (
+        v.name.includes('Natural') || 
+        v.name.includes('Google') || 
+        v.name.includes('Premium') || 
+        v.name.includes('Zira') || 
+        v.name.includes('Samantha')
+      ));
+      if (preferred) {
+        utterance.voice = preferred;
+      } else {
+        const eng = voices.find(v => v.lang.startsWith('en'));
+        if (eng) utterance.voice = eng;
+      }
+    }
+    
+    // Slight tweak to sound less robotic
+    utterance.rate = 1.05; 
+    utterance.pitch = 1.0;
+
     utterance.onstart = () => setIsSpeaking(true);
     utterance.onend = () => setIsSpeaking(false);
     utterance.onerror = () => setIsSpeaking(false);
     
     window.speechSynthesis.speak(utterance);
-  }, [ttsEnabled]);
+  }, [ttsEnabled, voices]);
 
   const generateInitialQuestion = async () => {
     setIsGeneratingNext(true);
@@ -277,13 +325,15 @@ export default function InterviewPage() {
 The candidate is presenting their project.
 Project Context: ${projectContext || "Not provided."}
 
-Ask a strong, engaging opening interview question based on this context and what you see on the screen.
-Also provide 3-5 'expected_points' that would make a great answer to your question.
+First, briefly introduce yourself and the interview process in ONE short sentence. 
+Then, politely ask the candidate to switch to their project screen so we can begin.
+DO NOT ASK ANY TECHNICAL QUESTIONS YET. KEEP YOUR ENTIRE RESPONSE EXTREMELY SHORT (1-2 simple sentences maximum). Do not ramble.
 
 Return ONLY valid JSON in this format:
 {
-  "question": "your opening question",
-  "expected_points": ["point 1", "point 2", "point 3"]
+  "question": "your brief introduction and request to see the screen",
+  "expected_points": ["Candidate switches to the screen"],
+  "rationale": "Setting up the interview"
 }`;
 
       const data = await fetchGeminiWithRetry({ apiKey, prompt, imageBase64: frameBase64 || undefined });
@@ -291,12 +341,15 @@ Return ONLY valid JSON in this format:
       try {
         const jsonStr = data.text.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
         const parsed = JSON.parse(jsonStr);
-        setCurrentQuestion({ question: parsed.question, expected_points: parsed.expected_points });
+        setCurrentQuestion({ question: parsed.question, expected_points: parsed.expected_points, rationale: parsed.rationale });
         speak(parsed.question);
+        setActivityLog(prev => [...prev, { id: Date.now().toString() + Math.random(), type: 'question', timestamp: Date.now(), content: parsed.question }]);
       } catch (e) {
         console.error("JSON parse error:", e, "Raw text:", data.text);
-        setCurrentQuestion({ question: "Could you start by giving a brief overview of what you're showing on the screen right now?", expected_points: ["Overview of UI/Code", "Main purpose"] });
-        speak("Could you start by giving a brief overview of what you're showing on the screen right now?");
+        const q = "Could you start by giving a brief overview of what you're showing on the screen right now?";
+        setCurrentQuestion({ question: q, expected_points: ["Overview of UI/Code", "Main purpose"], rationale: "Standard fallback opening question." });
+        speak(q);
+        setActivityLog(prev => [...prev, { id: Date.now().toString() + Math.random(), type: 'question', timestamp: Date.now(), content: q }]);
       }
 
     } catch (err: any) {
@@ -350,33 +403,53 @@ Return ONLY valid JSON in this format:
       id: exchangeId,
       timestamp: Date.now(),
       question: currentQuestion.question,
+      rationale: currentQuestion.rationale,
       answer: answerText,
       expected_points: currentQuestion.expected_points,
     };
 
-    setHistory(prev => [...prev, newExchange]);
+    const newHistory = [...history, newExchange];
+    setHistory(newHistory);
     setCurrentQuestion(null);
     setTranscript("");
 
+    setActivityLog(prev => [...prev, { id: Date.now().toString() + Math.random(), type: 'answer', timestamp: Date.now(), content: answerText }]);
+
+    if (newHistory.length >= targetQuestions) {
+      setShowTargetReachedModal(true);
+      setIsGeneratingNext(false);
+      return;
+    }
+
+    await generateFollowUp(newHistory);
+  };
+
+  const generateFollowUp = async (currentHistory: QAExchange[]) => {
+    setIsGeneratingNext(true);
     try {
-      const recentContexts = screenAnalyses.map(s => s.visualContext).join(" | ");
+      const recentContexts = screenAnalyses.slice(-4).map(s => s.visualContext).join(" | ");
       
       const prompt = `You are an expert technical interviewer.
 Project Context: ${projectContext || "Not provided."}
 
 Here is the conversation so far:
-${[...history, newExchange].map(h => `Q: ${h.question}\nA: ${h.answer}`).join("\n\n")}
+${currentHistory.map(h => `Q: ${h.question}\nA: ${h.answer}`).join("\n\n")}
 
 Recent screen analysis: ${recentContexts}
 
 Based on the candidate's last answer and what is currently on the screen, generate a relevant FOLLOW-UP question. 
-It could probe deeper into their answer, ask about a specific technical detail, or ask about something newly visible on screen.
-Also provide 3-5 'expected_points' for the new question.
+CRITICAL RULES:
+1. ASK ONLY ONE CLEAR AND SIMPLE QUESTION.
+2. KEEP IT EXTREMELY BRIEF (1-2 short sentences max). Do not use multiple long sentences or ramble.
+3. Be conversational but concise and easy to understand.
+
+Also provide 3-5 'expected_points' for the new question, and a brief 'rationale' for why you are asking this question.
 
 Return ONLY valid JSON in this format:
 {
   "question": "your follow-up question",
-  "expected_points": ["point 1", "point 2"]
+  "expected_points": ["point 1", "point 2"],
+  "rationale": "reason for asking"
 }`;
 
       const data = await fetchGeminiWithRetry({ apiKey, prompt });
@@ -384,12 +457,15 @@ Return ONLY valid JSON in this format:
       try {
         const jsonStr = data.text.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
         const parsed = JSON.parse(jsonStr);
-        setCurrentQuestion({ question: parsed.question, expected_points: parsed.expected_points });
+        setCurrentQuestion({ question: parsed.question, expected_points: parsed.expected_points, rationale: parsed.rationale });
         speak(parsed.question);
+        setActivityLog(prev => [...prev, { id: Date.now().toString() + Math.random(), type: 'question', timestamp: Date.now(), content: parsed.question }]);
       } catch (e) {
         console.error("JSON parse error:", e, "Raw text:", data.text);
-        setCurrentQuestion({ question: "Could you tell me more about the technical challenges you faced here?", expected_points: ["Challenge description", "Solution"] });
-        speak("Could you tell me more about the technical challenges you faced here?");
+        const q = "Could you tell me more about the technical challenges you faced here?";
+        setCurrentQuestion({ question: q, expected_points: ["Challenge description", "Solution"], rationale: "Standard fallback follow-up." });
+        speak(q);
+        setActivityLog(prev => [...prev, { id: Date.now().toString() + Math.random(), type: 'question', timestamp: Date.now(), content: q }]);
       }
 
     } catch (err: any) {
@@ -465,6 +541,12 @@ Return ONLY valid JSON in this format:
           
           <div className="h-4 w-px bg-border" />
           
+          <span className="text-sm font-medium text-muted-foreground hidden sm:inline-block">
+            Question {history.length + (currentQuestion ? 1 : 0)} of {targetQuestions}
+          </span>
+          
+          <div className="h-4 w-px bg-border hidden sm:block" />
+
           <button 
             onClick={() => {
               setTtsEnabled(!ttsEnabled);
@@ -486,7 +568,9 @@ Return ONLY valid JSON in this format:
       </header>
 
       {/* Main Content */}
-      <main className="flex-1 max-w-4xl w-full mx-auto p-6 flex flex-col gap-8">
+      <div className="flex-1 w-full max-w-7xl mx-auto flex flex-col lg:flex-row">
+        {/* Main Center Area */}
+        <main className="flex-1 p-6 flex flex-col gap-8">
         
         {/* Error Banner */}
         {errorMsg && (
@@ -497,7 +581,37 @@ Return ONLY valid JSON in this format:
         )}
 
         {/* Current Question Area */}
-        <div className="flex-1 flex flex-col items-center justify-center text-center space-y-8 min-h-[40vh]">
+        <div className="flex-1 flex flex-col items-center justify-center text-center space-y-8 min-h-[40vh] relative">
+          
+          {currentQuestion && !isGeneratingNext && (
+             <div className="absolute top-0 right-0 max-w-sm text-left hidden sm:block z-10">
+               <button 
+                 onClick={() => setShowReasoning(!showReasoning)}
+                 className="flex items-center gap-2 text-xs font-medium bg-muted hover:bg-muted/80 text-muted-foreground px-3 py-1.5 rounded-full transition-colors ml-auto"
+               >
+                 <Brain className="w-3.5 h-3.5" />
+                 AI Reasoning
+                 {showReasoning ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+               </button>
+               {showReasoning && (
+                 <div className="mt-2 p-4 bg-card border border-border shadow-lg rounded-xl text-sm space-y-3 animate-in slide-in-from-top-2 w-72">
+                   <div>
+                     <span className="text-[10px] font-semibold uppercase text-muted-foreground mb-1 block">Visual Context</span>
+                     <p className="text-muted-foreground leading-relaxed line-clamp-2 text-xs">
+                       {screenAnalyses.length > 0 ? screenAnalyses[screenAnalyses.length - 1].visualContext : "None"}
+                     </p>
+                   </div>
+                   <div>
+                     <span className="text-[10px] font-semibold uppercase text-muted-foreground mb-1 block">Why this question?</span>
+                     <p className="text-muted-foreground leading-relaxed text-xs">
+                       {currentQuestion.rationale || "Following up based on the presentation flow."}
+                     </p>
+                   </div>
+                 </div>
+               )}
+             </div>
+          )}
+
           {isGeneratingNext ? (
             <div className="flex flex-col items-center gap-4 text-muted-foreground">
               <Loader2 className="w-8 h-8 animate-spin text-primary" />
@@ -586,7 +700,34 @@ Return ONLY valid JSON in this format:
             </div>
           </div>
         )}
-      </main>
+        </main>
+
+        {/* Sidebar: Timeline */}
+        <aside className="w-full lg:w-80 border-l border-border bg-card/30 p-6 flex-col hidden lg:flex">
+          <div className="flex items-center gap-2 mb-6 shrink-0">
+            <Clock className="w-4 h-4 text-primary" />
+            <h3 className="font-semibold tracking-tight text-sm uppercase">Activity Log</h3>
+          </div>
+          <div className="flex-1 overflow-y-auto pr-2 space-y-4">
+            {activityLog.map((log) => (
+               <div key={log.id} className="flex gap-3">
+                 <div className="flex flex-col items-center mt-1">
+                   <div className={`w-2 h-2 rounded-full shrink-0 ${
+                      log.type === 'question' ? 'bg-blue-500' : 
+                      log.type === 'answer' ? 'bg-green-500' : 
+                      'bg-muted-foreground'
+                   }`} />
+                   <div className="w-px h-full bg-border mt-1" />
+                 </div>
+                 <div className="pb-4 flex-1">
+                   <span className="text-[10px] text-muted-foreground uppercase tracking-wider font-medium">{log.type}</span>
+                   <p className="text-sm mt-0.5 line-clamp-3 text-foreground/80">{log.content}</p>
+                 </div>
+               </div>
+            ))}
+          </div>
+        </aside>
+      </div>
 
       {/* Floating Elements: Screen Preview & Analysis Indicator */}
       <div className="fixed bottom-6 right-6 flex flex-col items-end gap-4 pointer-events-none">
@@ -621,9 +762,17 @@ Return ONLY valid JSON in this format:
             muted 
             className="w-full h-full object-cover"
           />
-          <div className="absolute top-2 left-2 bg-black/60 backdrop-blur-sm px-2 py-1 rounded text-[10px] font-medium text-white flex items-center gap-1.5">
-            <Video className="w-3 h-3" />
-            Live Preview
+          <div className="absolute top-2 left-2 flex gap-2">
+            <div className="bg-black/60 backdrop-blur-sm px-2 py-1 rounded text-[10px] font-medium text-white flex items-center gap-1.5 shadow-sm">
+              <Video className="w-3 h-3" />
+              Live Preview
+            </div>
+            {screenAnalyses.length > 0 && screenAnalyses[screenAnalyses.length - 1].contentType && screenAnalyses[screenAnalyses.length - 1].contentType !== "unclear" && (
+              <div className="bg-primary/90 backdrop-blur-sm px-2 py-1 rounded text-[10px] font-medium text-primary-foreground flex items-center gap-1.5 shadow-sm">
+                <Flag className="w-3 h-3" />
+                {screenAnalyses[screenAnalyses.length - 1].contentType}
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -667,6 +816,38 @@ Return ONLY valid JSON in this format:
               </button>
               <button onClick={handleEndInterview} className="w-full px-4 py-2 bg-muted hover:bg-muted/80 text-foreground rounded-md text-sm font-medium transition-colors">
                 End Interview Now
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showTargetReachedModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-in fade-in duration-200">
+          <div className="bg-card w-full max-w-sm rounded-xl p-6 shadow-xl border border-border flex flex-col gap-4 animate-in zoom-in-95 duration-200">
+            <div className="flex items-center gap-2 text-primary">
+              <Target className="w-5 h-5" />
+              <h3 className="text-xl font-semibold tracking-tight text-foreground">Target Reached</h3>
+            </div>
+            <p className="text-sm text-muted-foreground">
+              You've completed the target of {targetQuestions} questions. Do you want to finish the interview and see your results, or continue for one more question?
+            </p>
+            <div className="flex gap-3 flex-col mt-2">
+              <button 
+                onClick={handleEndInterview} 
+                className="w-full px-4 py-2 bg-primary text-primary-foreground hover:bg-primary/90 rounded-md text-sm font-medium transition-colors"
+              >
+                Finish & See Results
+              </button>
+              <button 
+                onClick={() => {
+                  setShowTargetReachedModal(false);
+                  setTargetQuestions(prev => prev + 1);
+                  generateFollowUp(history);
+                }} 
+                className="w-full px-4 py-2 bg-muted hover:bg-muted/80 text-foreground rounded-md text-sm font-medium transition-colors"
+              >
+                Ask One More
               </button>
             </div>
           </div>
