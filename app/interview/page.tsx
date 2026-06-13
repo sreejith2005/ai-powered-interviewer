@@ -18,6 +18,7 @@ export default function InterviewPage() {
 
   // Core state
   const [status, setStatus] = useState<"idle" | "requesting_permissions" | "interviewing" | "ending">("idle");
+  const [syntheticAnswer, setSyntheticAnswer] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState("");
   const [sttSupported, setSttSupported] = useState<boolean>(true);
   
@@ -36,6 +37,7 @@ export default function InterviewPage() {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isGeneratingNext, setIsGeneratingNext] = useState(false);
   const [showReasoning, setShowReasoning] = useState(false);
+  const [isWaitingForProject, setIsWaitingForProject] = useState(false);
   
   // Modals & transient errors
   const [showEndConfirm, setShowEndConfirm] = useState(false);
@@ -59,6 +61,15 @@ export default function InterviewPage() {
   const screenStreamRef = useRef<MediaStream | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
   const captureIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const silenceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  
+  const historyLenRef = useRef(0);
+  const isGeneratingNextRef = useRef(false);
+  const isWaitingForProjectRef = useRef(false);
+
+  useEffect(() => { historyLenRef.current = history.length; }, [history]);
+  useEffect(() => { isGeneratingNextRef.current = isGeneratingNext; }, [isGeneratingNext]);
+  useEffect(() => { isWaitingForProjectRef.current = isWaitingForProject; }, [isWaitingForProject]);
 
   // Load context on mount
   useEffect(() => {
@@ -95,14 +106,14 @@ export default function InterviewPage() {
         };
 
         recognitionRef.current.onerror = (event: any) => {
-          console.error("Speech recognition error", event.error);
-          setIsListening(false);
           if (event.error === 'no-speech' || event.error === 'network') {
-            setSttError("Didn't catch that — try again");
-            setTimeout(() => setSttError(""), 3000);
+            // Silently ignore in continuous mode. 
+            // It will naturally trigger onend and our auto-restart logic will kick in.
           } else if (event.error !== 'aborted') {
+            console.error("Speech recognition error", event.error);
             setErrorMsg(`Microphone error: ${event.error}`);
           }
+          setIsListening(false);
         };
 
         recognitionRef.current.onend = () => {
@@ -124,6 +135,42 @@ export default function InterviewPage() {
       endInterviewCleanup();
     };
   }, [router]);
+
+  // Handle continuous listening auto-start
+  useEffect(() => {
+    if (currentQuestion && !isGeneratingNext && !isSpeaking && !isListening && sttSupported && recognitionRef.current) {
+      try {
+        recognitionRef.current.start();
+        setIsListening(true);
+      } catch (e) {
+        // Recognition might already be started or in a conflicting state, ignore
+      }
+    }
+  }, [currentQuestion, isGeneratingNext, isSpeaking, isListening, sttSupported]);
+
+  // Strict Turn-Taking: Force mic OFF if AI is thinking or speaking
+  useEffect(() => {
+    if ((isGeneratingNext || isSpeaking) && isListening && recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch(e) {}
+      setIsListening(false);
+    }
+  }, [isGeneratingNext, isSpeaking, isListening]);
+
+  // Handle silence detection (submit after 1.5s of no new transcript)
+  useEffect(() => {
+    // Lower threshold to 5 chars so it doesn't get stuck, and use a much snappier 1.5s timeout
+    if (transcript.trim().length >= 5 && isListening) {
+      if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current);
+      silenceTimeoutRef.current = setTimeout(() => {
+        handleStopAnswering(transcript);
+      }, 1500);
+    }
+    return () => {
+      if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current);
+    };
+  }, [transcript, isListening]);
 
   const endInterviewCleanup = useCallback(() => {
     if (captureIntervalRef.current) clearInterval(captureIntervalRef.current);
@@ -173,8 +220,15 @@ export default function InterviewPage() {
         if (captureIntervalRef.current) clearInterval(captureIntervalRef.current);
       };
 
-      // Microphone
-      const mic = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      // Microphone with noise suppression enabled
+      const mic = await navigator.mediaDevices.getUserMedia({ 
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        }, 
+        video: false 
+      });
       micStreamRef.current = mic;
 
       setStatus("interviewing");
@@ -261,6 +315,11 @@ export default function InterviewPage() {
       setScreenAnalyses(prev => [...prev, analysis]);
 
       setActivityLog(prev => [...prev, { id: Date.now().toString() + Math.random(), type: 'analysis', timestamp: Date.now(), content: description }]);
+
+      // PROACTIVE TRIGGER: If we are waiting for the project, and we see a valid screen, trigger it!
+      if (isWaitingForProjectRef.current && contentType !== "unclear" && !isGeneratingNextRef.current) {
+        setSyntheticAnswer(`[Candidate opened project screen showing: ${description}]`);
+      }
     } catch (err) {
       console.error("Screen analysis error:", err);
     } finally {
@@ -322,18 +381,19 @@ export default function InterviewPage() {
       }
 
       const prompt = `You are an expert technical interviewer. 
-The candidate is presenting their project.
+The candidate is ready to start.
 Project Context: ${projectContext || "Not provided."}
 
-First, briefly introduce yourself and the interview process in ONE short sentence. 
-Then, politely ask the candidate to switch to their project screen so we can begin.
-DO NOT ASK ANY TECHNICAL QUESTIONS YET. KEEP YOUR ENTIRE RESPONSE EXTREMELY SHORT (1-2 simple sentences maximum). Do not ramble.
+First, briefly introduce yourself in ONE short sentence. 
+Then, ask the candidate to briefly introduce themselves and their technical background.
+DO NOT ASK ABOUT THE PROJECT OR ASK TO SHARE SCREEN YET. KEEP YOUR ENTIRE RESPONSE EXTREMELY SHORT (1-2 simple sentences maximum). Do not ramble.
 
 Return ONLY valid JSON in this format:
 {
-  "question": "your brief introduction and request to see the screen",
-  "expected_points": ["Candidate switches to the screen"],
-  "rationale": "Setting up the interview"
+  "question": "your brief introduction and question",
+  "expected_points": ["Candidate's name", "Candidate background"],
+  "rationale": "Breaking the ice",
+  "action": "none"
 }`;
 
       const data = await fetchGeminiWithRetry({ apiKey, prompt, imageBase64: frameBase64 || undefined });
@@ -377,7 +437,7 @@ Return ONLY valid JSON in this format:
     }
   };
 
-  const handleStopAnswering = async () => {
+  const handleStopAnswering = async (finalTranscript?: string) => {
     if (!sttSupported || !recognitionRef.current) return;
     
     try {
@@ -385,18 +445,31 @@ Return ONLY valid JSON in this format:
     } catch(e) {}
     setIsListening(false);
     
-    if (transcript.trim().length < 5) {
-      setErrorMsg("Answer too short. Please try again or hold the button longer.");
+    const textToSubmit = finalTranscript || transcript;
+    if (textToSubmit.trim().length < 5) {
       return;
     }
 
-    await submitAnswerAndGetNext(transcript);
+    await submitAnswerAndGetNext(textToSubmit);
   };
+
+  // Synthetic answer execution
+  useEffect(() => {
+    if (syntheticAnswer) {
+      submitAnswerAndGetNext(syntheticAnswer);
+      setSyntheticAnswer(null);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [syntheticAnswer]);
 
   const submitAnswerAndGetNext = async (answerText: string) => {
     if (!currentQuestion) return;
 
     setIsGeneratingNext(true);
+    if (isListening && recognitionRef.current) {
+      try { recognitionRef.current.stop(); } catch(e){}
+      setIsListening(false);
+    }
     const exchangeId = Math.random().toString(36).substring(7);
     
     const newExchange: QAExchange = {
@@ -439,17 +512,21 @@ Recent screen analysis: ${recentContexts}
 
 Based on the candidate's last answer and what is currently on the screen, generate a relevant FOLLOW-UP question. 
 CRITICAL RULES:
-1. ASK ONLY ONE CLEAR AND SIMPLE QUESTION.
-2. KEEP IT EXTREMELY BRIEF (1-2 short sentences max). Do not use multiple long sentences or ramble.
-3. Be conversational but concise and easy to understand.
+1. If you haven't asked to see the project yet, your next question MUST politely ask them to bring up their project on the screen.
+2. If they are already showing the project, ask a specific technical question about what is visible or what they just said.
+3. ASK ONLY ONE CLEAR AND SIMPLE QUESTION.
+4. KEEP IT EXTREMELY BRIEF (1-2 short sentences max). Do not use multiple long sentences or ramble.
+5. Be conversational but concise and easy to understand.
 
-Also provide 3-5 'expected_points' for the new question, and a brief 'rationale' for why you are asking this question.
+Also provide 3-5 'expected_points' for the new question, a brief 'rationale', and an 'action'.
+Set 'action' to "wait_for_project_screen" ONLY IF your question is explicitly asking them to share or open their project screen. Otherwise set it to "none".
 
 Return ONLY valid JSON in this format:
 {
   "question": "your follow-up question",
   "expected_points": ["point 1", "point 2"],
-  "rationale": "reason for asking"
+  "rationale": "reason for asking",
+  "action": "wait_for_project_screen" | "none"
 }`;
 
       const data = await fetchGeminiWithRetry({ apiKey, prompt });
@@ -458,6 +535,7 @@ Return ONLY valid JSON in this format:
         const jsonStr = data.text.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
         const parsed = JSON.parse(jsonStr);
         setCurrentQuestion({ question: parsed.question, expected_points: parsed.expected_points, rationale: parsed.rationale });
+        setIsWaitingForProject(parsed.action === "wait_for_project_screen");
         speak(parsed.question);
         setActivityLog(prev => [...prev, { id: Date.now().toString() + Math.random(), type: 'question', timestamp: Date.now(), content: parsed.question }]);
       } catch (e) {
@@ -655,26 +733,24 @@ Return ONLY valid JSON in this format:
               )}
             </div>
 
-            <button
-              onMouseDown={handleStartAnswering}
-              onMouseUp={handleStopAnswering}
-              onMouseLeave={isListening ? handleStopAnswering : undefined}
-              onTouchStart={handleStartAnswering}
-              onTouchEnd={handleStopAnswering}
-              disabled={!sttSupported}
+            <div
               className={`
                 w-32 h-32 rounded-full flex flex-col items-center justify-center gap-2 transition-all select-none
                 ${isListening 
-                  ? "bg-red-500 text-white shadow-[0_0_40px_rgba(239,68,68,0.5)] scale-95" 
-                  : "bg-primary text-primary-foreground hover:bg-primary/90 hover:scale-105 shadow-lg"}
+                  ? transcript.trim().length > 0
+                    ? "bg-red-500 text-white shadow-[0_0_40px_rgba(239,68,68,0.5)] animate-pulse" 
+                    : "bg-red-500/90 text-white"
+                  : "bg-muted text-muted-foreground"}
                 ${!sttSupported && "opacity-50 cursor-not-allowed"}
               `}
             >
               {isListening ? <Mic className="w-8 h-8" /> : <MicOff className="w-8 h-8 opacity-70" />}
-              <span className="text-xs font-semibold">
-                {isListening ? "RELEASE" : "HOLD TO ANSWER"}
+              <span className="text-[10px] font-bold text-center leading-tight">
+                {isListening 
+                  ? (transcript.trim().length > 0 ? "HEARING..." : "MIC ON\nWAITING") 
+                  : "PAUSED"}
               </span>
-            </button>
+            </div>
           </div>
         )}
 

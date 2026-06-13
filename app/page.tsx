@@ -119,7 +119,7 @@ export default function SetupPage() {
   const handleStartInterview = async () => {
     setErrorMsg("");
     if (!apiKey.trim()) {
-      setErrorMsg("Please enter your Gemini API key.");
+      setErrorMsg("Please enter your API key.");
       return;
     }
 
@@ -227,7 +227,7 @@ export default function SetupPage() {
             {/* API Key Section */}
             <div className="flex flex-col gap-3">
               <label htmlFor="api-key" className="text-sm font-medium">
-                Gemini API Key
+                API Key (Gemini or OpenRouter)
               </label>
               <div className="relative">
                 <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-muted-foreground">
