@@ -272,14 +272,15 @@ export default function InterviewPage() {
       
       if (silenceCheckIntervalRef.current) clearInterval(silenceCheckIntervalRef.current);
       
-      console.log(`[SPEECH ${new Date().toISOString().split('T')[1]}] Started silence interval`);
       silenceCheckIntervalRef.current = setInterval(() => {
-        if (!isListeningRef.current) return;
-        
         const now = Date.now();
         const silenceDuration = now - lastSpeechTimestampRef.current;
         const listenDuration = now - listenStartTimeRef.current;
         const words = accumulatedTranscriptRef.current.trim().split(/\s+/).length;
+        
+        console.log(`[SPEECH TICK] isListening=${isListeningRef.current}, silenceDuration=${silenceDuration}ms, words=${words}, transcript="${accumulatedTranscriptRef.current}"`);
+
+        if (!isListeningRef.current) return;
         
         if (silenceDuration > SILENCE_MS && words >= 2) {
           console.log(`[SPEECH ${new Date().toISOString().split('T')[1]}] Finalizing due to silence (${silenceDuration}ms, ${words} words)`);
