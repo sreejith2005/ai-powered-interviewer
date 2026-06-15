@@ -2,8 +2,8 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
-import { Mic, Video, MicOff, AlertCircle, Loader2, Eye, EyeOff, Volume2, VolumeX, MessageSquare, Brain, Clock, ChevronDown, ChevronUp, Flag, Target } from "lucide-react";
-import { QAExchange, ScreenAnalysis, ActivityEvent } from "@/types";
+import { Mic, Video, MicOff, AlertCircle, Loader2, Eye, EyeOff, Volume2, VolumeX, MessageSquare, Brain, Clock, ChevronDown, ChevronUp, Flag, Target, Bug } from "lucide-react";
+import { QAExchange, ScreenAnalysis, ActivityEvent, InterviewPhase } from "@/types";
 
 // Type definitions for Web Speech API
 declare global {
@@ -13,12 +13,17 @@ declare global {
   }
 }
 
+const SILENCE_MS = 1500;
+const STT_START_DELAY_MS = 400;
+const MAX_LISTEN_MS = 45000;
+const CHECK_INTERVAL_MS = 300;
+
 export default function InterviewPage() {
   const router = useRouter();
 
   // Core state
   const [status, setStatus] = useState<"idle" | "requesting_permissions" | "interviewing" | "ending">("idle");
-  const [syntheticAnswer, setSyntheticAnswer] = useState<string | null>(null);
+  const [phase, setPhase] = useState<InterviewPhase>("intro");
   const [errorMsg, setErrorMsg] = useState("");
   const [sttSupported, setSttSupported] = useState<boolean>(true);
   
@@ -37,7 +42,6 @@ export default function InterviewPage() {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isGeneratingNext, setIsGeneratingNext] = useState(false);
   const [showReasoning, setShowReasoning] = useState(false);
-  const [isWaitingForProject, setIsWaitingForProject] = useState(false);
   
   // Modals & transient errors
   const [showEndConfirm, setShowEndConfirm] = useState(false);
@@ -50,9 +54,13 @@ export default function InterviewPage() {
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
 
-  // STT State
+  // STT & VAD State
   const [isListening, setIsListening] = useState(false);
   const [transcript, setTranscript] = useState("");
+  
+  // Debug State
+  const [showDebug, setShowDebug] = useState(false);
+  const [debugEvents, setDebugEvents] = useState<{time: number, event: string}[]>([]);
 
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -61,15 +69,27 @@ export default function InterviewPage() {
   const screenStreamRef = useRef<MediaStream | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
   const captureIntervalRef = useRef<NodeJS.Timeout | null>(null);
-  const silenceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  
+  // VAD refs
+  const lastSpeechTimestampRef = useRef<number>(0);
+  const accumulatedTranscriptRef = useRef<string>("");
+  const listenStartTimeRef = useRef<number>(0);
+  const silenceCheckIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const startDelayTimerRef = useRef<NodeJS.Timeout | null>(null);
+  
+  const transcriptRef = useRef("");
+  const isListeningRef = useRef(false);
+  const isSpeakingRef = useRef(false);
   
   const historyLenRef = useRef(0);
-  const isGeneratingNextRef = useRef(false);
-  const isWaitingForProjectRef = useRef(false);
+  const latestScreenContextRef = useRef<string>("");
+  const phaseRef = useRef<InterviewPhase>("intro");
 
   useEffect(() => { historyLenRef.current = history.length; }, [history]);
-  useEffect(() => { isGeneratingNextRef.current = isGeneratingNext; }, [isGeneratingNext]);
-  useEffect(() => { isWaitingForProjectRef.current = isWaitingForProject; }, [isWaitingForProject]);
+  useEffect(() => { transcriptRef.current = transcript; }, [transcript]);
+  useEffect(() => { isListeningRef.current = isListening; }, [isListening]);
+  useEffect(() => { phaseRef.current = phase; }, [phase]);
+  useEffect(() => { isSpeakingRef.current = isSpeaking; }, [isSpeaking]);
 
   // Load context on mount
   useEffect(() => {
@@ -93,32 +113,56 @@ export default function InterviewPage() {
       if (!SpeechRecognition) {
         setSttSupported(false);
       } else {
-        recognitionRef.current = new SpeechRecognition();
-        recognitionRef.current.continuous = true;
-        recognitionRef.current.interimResults = true;
-        
-        recognitionRef.current.onresult = (event: any) => {
-          let combined = "";
-          for (let i = 0; i < event.results.length; ++i) {
-             combined += event.results[i][0].transcript;
-          }
-          setTranscript(combined);
-        };
+        if (!recognitionRef.current) {
+          recognitionRef.current = new SpeechRecognition();
+          recognitionRef.current.continuous = true;
+          recognitionRef.current.interimResults = true;
+          recognitionRef.current.lang = 'en-US';
 
-        recognitionRef.current.onerror = (event: any) => {
-          if (event.error === 'no-speech' || event.error === 'network') {
-            // Silently ignore in continuous mode. 
-            // It will naturally trigger onend and our auto-restart logic will kick in.
-          } else if (event.error !== 'aborted') {
-            console.error("Speech recognition error", event.error);
-            setErrorMsg(`Microphone error: ${event.error}`);
-          }
-          setIsListening(false);
-        };
+          const logSpeech = (event: string, details?: any) => {
+            const ts = new Date().toISOString().split('T')[1];
+            console.log(`[SPEECH ${ts}] ${event}`, details || "");
+            setDebugEvents(prev => [{time: Date.now(), event: `SPEECH: ${event}`}, ...prev].slice(0, 5));
+          };
 
-        recognitionRef.current.onend = () => {
-          setIsListening(false);
-        };
+          recognitionRef.current.onstart = () => {
+            logSpeech('onstart fired');
+          };
+
+          recognitionRef.current.onresult = (event: any) => {
+            let combined = "";
+            let latestIsFinal = false;
+            for (let i = 0; i < event.results.length; ++i) {
+               combined += event.results[i][0].transcript;
+               if (i === event.results.length - 1) {
+                 latestIsFinal = event.results[i].isFinal;
+               }
+            }
+            logSpeech('onresult fired', { transcript: combined, isFinal: latestIsFinal });
+
+            accumulatedTranscriptRef.current = combined;
+            setTranscript(combined);
+
+            if (combined.trim().length > 0) {
+              lastSpeechTimestampRef.current = Date.now();
+            }
+          };
+
+          recognitionRef.current.onerror = (event: any) => {
+            logSpeech(`onerror fired: ${event.error}`);
+            if (event.error === 'no-speech' || event.error === 'network') {
+              // Silently ignore in continuous mode. 
+            } else if (event.error !== 'aborted') {
+              console.error("Speech recognition error", event.error);
+              setErrorMsg(`Microphone error: ${event.error}`);
+            }
+          };
+
+          recognitionRef.current.onend = () => {
+            logSpeech('onend fired');
+            window.dispatchEvent(new Event('app-recognition-end'));
+          };
+        }
       }
 
       // Load TTS Voices
@@ -136,44 +180,197 @@ export default function InterviewPage() {
     };
   }, [router]);
 
-  // Handle continuous listening auto-start
-  useEffect(() => {
-    if (currentQuestion && !isGeneratingNext && !isSpeaking && !isListening && sttSupported && recognitionRef.current) {
+  const stopListening = useCallback(() => {
+    if (silenceCheckIntervalRef.current) {
+      clearInterval(silenceCheckIntervalRef.current);
+      silenceCheckIntervalRef.current = null;
+    }
+    if (recognitionRef.current) {
       try {
-        recognitionRef.current.start();
-        setIsListening(true);
-      } catch (e) {
-        // Recognition might already be started or in a conflicting state, ignore
+        console.log(`[SPEECH ${new Date().toISOString().split('T')[1]}] recognition.stop() called`);
+        recognitionRef.current.stop(); 
+      } catch(e) {}
+    }
+    setIsListening(false);
+  }, []);
+
+  // Unified Answer Completion Handler
+  const handleAnswerComplete = useCallback(async (answerText: string) => {
+    if (!currentQuestion) return;
+
+    setIsGeneratingNext(true);
+    stopListening();
+    
+    const exchangeId = Math.random().toString(36).substring(7);
+    
+    const newExchange: QAExchange = {
+      id: exchangeId,
+      timestamp: Date.now(),
+      question: currentQuestion.question,
+      rationale: currentQuestion.rationale,
+      answer: answerText,
+      expected_points: currentQuestion.expected_points,
+    };
+
+    const newHistory = [...history, newExchange];
+    setHistory(newHistory);
+    setCurrentQuestion(null);
+    setTranscript("");
+
+    setActivityLog(prev => [...prev, { id: Date.now().toString() + Math.random(), type: 'answer', timestamp: Date.now(), content: answerText }]);
+
+    if (newHistory.length >= targetQuestions) {
+      setShowTargetReachedModal(true);
+      setIsGeneratingNext(false);
+      return;
+    }
+
+    if (phase === 'intro') {
+      if (newHistory.length === 1) {
+        const q = "Thanks! Now tell me about your project — what does it do and what problem does it solve?";
+        setCurrentQuestion({ question: q, expected_points: ["Project purpose"], rationale: "Gathering context" });
+        speak(q);
+        setIsGeneratingNext(false);
+        return;
+      } else {
+        setPhase('transition');
+        const q = "Awesome, that gives me a good sense of it. Go ahead and click 'Share Screen' below so I can see what you've built.";
+        setCurrentQuestion({ question: q, expected_points: [], rationale: "Transitioning" });
+        speak(q);
+        setIsGeneratingNext(false);
+        return;
       }
     }
-  }, [currentQuestion, isGeneratingNext, isSpeaking, isListening, sttSupported]);
+
+    if (phase === 'transition') {
+      const q = "I'm ready when you are! Just click 'Share Screen' whenever you're set.";
+      setCurrentQuestion({ question: q, expected_points: [], rationale: "Waiting for screen" });
+      speak(q);
+      setIsGeneratingNext(false);
+      return;
+    }
+
+    await generateFollowUp(newHistory);
+  }, [currentQuestion, history, phase, targetQuestions, stopListening]);
+
+  const finalizeAnswer = useCallback((finalText: string) => {
+    console.log(`[SPEECH ${new Date().toISOString().split('T')[1]}] finalizeAnswer called with: "${finalText}"`);
+    stopListening();
+    handleAnswerComplete(finalText);
+  }, [handleAnswerComplete, stopListening]);
+
+  const startListening = useCallback(() => {
+    if (!sttSupported || !recognitionRef.current) return;
+    try {
+      accumulatedTranscriptRef.current = "";
+      lastSpeechTimestampRef.current = Date.now();
+      listenStartTimeRef.current = Date.now();
+      
+      console.log(`[SPEECH ${new Date().toISOString().split('T')[1]}] recognition.start() called`);
+      recognitionRef.current.start();
+      setIsListening(true);
+      
+      if (silenceCheckIntervalRef.current) clearInterval(silenceCheckIntervalRef.current);
+      
+      console.log(`[SPEECH ${new Date().toISOString().split('T')[1]}] Started silence interval`);
+      silenceCheckIntervalRef.current = setInterval(() => {
+        if (!isListeningRef.current) return;
+        
+        const now = Date.now();
+        const silenceDuration = now - lastSpeechTimestampRef.current;
+        const listenDuration = now - listenStartTimeRef.current;
+        const words = accumulatedTranscriptRef.current.trim().split(/\s+/).length;
+        
+        if (silenceDuration > SILENCE_MS && words >= 2) {
+          console.log(`[SPEECH ${new Date().toISOString().split('T')[1]}] Finalizing due to silence (${silenceDuration}ms, ${words} words)`);
+          finalizeAnswer(accumulatedTranscriptRef.current);
+        } else if (listenDuration > MAX_LISTEN_MS) {
+          console.log(`[SPEECH ${new Date().toISOString().split('T')[1]}] Finalizing due to MAX_LISTEN_MS (${listenDuration}ms)`);
+          finalizeAnswer(accumulatedTranscriptRef.current || "[No response detected]");
+        }
+      }, CHECK_INTERVAL_MS);
+      
+    } catch (e) {
+      console.log(`[SPEECH ${new Date().toISOString().split('T')[1]}] start error`, e);
+      setIsListening(true); // Might already be running
+    }
+  }, [sttSupported, finalizeAnswer]);
+
+  // Handle continuous listening auto-start
+  useEffect(() => {
+    if (currentQuestion && !isGeneratingNext && !isSpeaking && !isListening && sttSupported && recognitionRef.current && phase !== 'transition') {
+      if (startDelayTimerRef.current) clearTimeout(startDelayTimerRef.current);
+      startDelayTimerRef.current = setTimeout(() => {
+         if (!isSpeakingRef.current && !isListeningRef.current) {
+           startListening();
+         }
+      }, STT_START_DELAY_MS);
+    }
+    return () => {
+       if (startDelayTimerRef.current) clearTimeout(startDelayTimerRef.current);
+    };
+  }, [currentQuestion, isGeneratingNext, isSpeaking, isListening, sttSupported, phase, startListening]);
 
   // Strict Turn-Taking: Force mic OFF if AI is thinking or speaking
   useEffect(() => {
-    if ((isGeneratingNext || isSpeaking) && isListening && recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch(e) {}
-      setIsListening(false);
+    if ((isGeneratingNext || isSpeaking) && isListening) {
+      stopListening();
     }
-  }, [isGeneratingNext, isSpeaking, isListening]);
+  }, [isGeneratingNext, isSpeaking, isListening, stopListening]);
 
-  // Handle silence detection (submit after 1.5s of no new transcript)
+  // Handle custom events
   useEffect(() => {
-    // Lower threshold to 5 chars so it doesn't get stuck, and use a much snappier 1.5s timeout
-    if (transcript.trim().length >= 5 && isListening) {
-      if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current);
-      silenceTimeoutRef.current = setTimeout(() => {
-        handleStopAnswering(transcript);
-      }, 1500);
-    }
-    return () => {
-      if (silenceTimeoutRef.current) clearTimeout(silenceTimeoutRef.current);
+    const handleRecEnd = () => {
+      if (isListeningRef.current) {
+        // Stopped unexpectedly while we thought we were listening
+        console.log(`[SPEECH ${new Date().toISOString().split('T')[1]}] Auto-restarting due to unexpected onend`);
+        try {
+          recognitionRef.current.start();
+        } catch(e) {}
+      } else {
+        setIsListening(false);
+      }
     };
-  }, [transcript, isListening]);
+
+    window.addEventListener('app-recognition-end', handleRecEnd);
+    return () => {
+      window.removeEventListener('app-recognition-end', handleRecEnd);
+    };
+  }, []);
+
+
+  const requestScreenShare = async () => {
+    try {
+      const screen = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+      screenStreamRef.current = screen;
+      if (videoRef.current) videoRef.current.srcObject = screen;
+      
+      screen.getVideoTracks()[0].onended = () => {
+        setShowScreenStopModal(true);
+        if (captureIntervalRef.current) clearInterval(captureIntervalRef.current);
+      };
+      
+      setPhase('walkthrough');
+      startScreenAnalysisLoop();
+
+      setIsGeneratingNext(true);
+      setTimeout(async () => {
+        const frameBase64 = captureFrame();
+        if (frameBase64) {
+          analyzeScreen();
+        }
+        await generateFollowUp(history, true);
+      }, 1000);
+      
+    } catch (err) {
+      setErrorMsg("Screen share failed. Please click 'Share Screen' to try again.");
+    }
+  };
 
   const endInterviewCleanup = useCallback(() => {
     if (captureIntervalRef.current) clearInterval(captureIntervalRef.current);
+    if (silenceCheckIntervalRef.current) clearInterval(silenceCheckIntervalRef.current);
+    if (startDelayTimerRef.current) clearTimeout(startDelayTimerRef.current);
     if (screenStreamRef.current) screenStreamRef.current.getTracks().forEach(t => t.stop());
     if (micStreamRef.current) micStreamRef.current.getTracks().forEach(t => t.stop());
     if (recognitionRef.current) {
@@ -206,21 +403,6 @@ export default function InterviewPage() {
     setErrorMsg("");
 
     try {
-      // Screen Share
-      const screen = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
-      screenStreamRef.current = screen;
-      
-      if (videoRef.current) {
-        videoRef.current.srcObject = screen;
-      }
-
-      // Handle screen share stop from browser UI
-      screen.getVideoTracks()[0].onended = () => {
-        setShowScreenStopModal(true);
-        if (captureIntervalRef.current) clearInterval(captureIntervalRef.current);
-      };
-
-      // Microphone with noise suppression enabled
       const mic = await navigator.mediaDevices.getUserMedia({ 
         audio: {
           echoCancellation: true,
@@ -230,13 +412,8 @@ export default function InterviewPage() {
         video: false 
       });
       micStreamRef.current = mic;
-
-      setStatus("interviewing");
       
-      // Start background analysis loop
-      startScreenAnalysisLoop();
-
-      // Trigger initial question
+      setStatus("interviewing");
       generateInitialQuestion();
 
     } catch (err: any) {
@@ -313,13 +490,9 @@ export default function InterviewPage() {
       };
       
       setScreenAnalyses(prev => [...prev, analysis]);
+      latestScreenContextRef.current = analysis.visualContext || "";
 
       setActivityLog(prev => [...prev, { id: Date.now().toString() + Math.random(), type: 'analysis', timestamp: Date.now(), content: description }]);
-
-      // PROACTIVE TRIGGER: If we are waiting for the project, and we see a valid screen, trigger it!
-      if (isWaitingForProjectRef.current && contentType !== "unclear" && !isGeneratingNextRef.current) {
-        setSyntheticAnswer(`[Candidate opened project screen showing: ${description}]`);
-      }
     } catch (err) {
       console.error("Screen analysis error:", err);
     } finally {
@@ -370,163 +543,61 @@ export default function InterviewPage() {
     setIsGeneratingNext(true);
     setErrorMsg("");
     
-    try {
-      // Small delay to allow stream to mount so we might catch the first frame
-      await new Promise(r => setTimeout(r, 1000));
-      const frameBase64 = captureFrame();
-      
-      if (frameBase64) {
-          // Send off the first background analysis manually so we have context quickly
-          analyzeScreen();
-      }
-
-      const prompt = `You are an expert technical interviewer. 
-The candidate is ready to start.
-Project Context: ${projectContext || "Not provided."}
-
-First, briefly introduce yourself in ONE short sentence. 
-Then, ask the candidate to briefly introduce themselves and their technical background.
-DO NOT ASK ABOUT THE PROJECT OR ASK TO SHARE SCREEN YET. KEEP YOUR ENTIRE RESPONSE EXTREMELY SHORT (1-2 simple sentences maximum). Do not ramble.
-
-Return ONLY valid JSON in this format:
-{
-  "question": "your brief introduction and question",
-  "expected_points": ["Candidate's name", "Candidate background"],
-  "rationale": "Breaking the ice",
-  "action": "none"
-}`;
-
-      const data = await fetchGeminiWithRetry({ apiKey, prompt, imageBase64: frameBase64 || undefined });
-      
-      try {
-        const jsonStr = data.text.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
-        const parsed = JSON.parse(jsonStr);
-        setCurrentQuestion({ question: parsed.question, expected_points: parsed.expected_points, rationale: parsed.rationale });
-        speak(parsed.question);
-        setActivityLog(prev => [...prev, { id: Date.now().toString() + Math.random(), type: 'question', timestamp: Date.now(), content: parsed.question }]);
-      } catch (e) {
-        console.error("JSON parse error:", e, "Raw text:", data.text);
-        const q = "Could you start by giving a brief overview of what you're showing on the screen right now?";
-        setCurrentQuestion({ question: q, expected_points: ["Overview of UI/Code", "Main purpose"], rationale: "Standard fallback opening question." });
-        speak(q);
-        setActivityLog(prev => [...prev, { id: Date.now().toString() + Math.random(), type: 'question', timestamp: Date.now(), content: q }]);
-      }
-
-    } catch (err: any) {
-      console.error(err);
-      setErrorMsg("Failed to start the interview. Please check your API key.");
-    } finally {
-      setIsGeneratingNext(false);
-    }
+    const q = "Hi! Before we get started, could you introduce yourself briefly?";
+    setCurrentQuestion({ question: q, expected_points: ["Candidate's name", "Candidate background"], rationale: "Breaking the ice" });
+    speak(q);
+    setActivityLog(prev => [...prev, { id: Date.now().toString() + Math.random(), type: 'question', timestamp: Date.now(), content: q }]);
+    
+    setIsGeneratingNext(false);
   };
 
   const handleStartAnswering = () => {
     if (!sttSupported || !recognitionRef.current) return;
     
-    window.speechSynthesis.cancel(); // Stop talking if we are talking
+    window.speechSynthesis.cancel();
     setIsSpeaking(false);
-
     setTranscript("");
     setErrorMsg("");
-    try {
-      recognitionRef.current.start();
-      setIsListening(true);
-    } catch (e) {
-      console.error(e);
-      setIsListening(true); // Might already be running
-    }
+    startListening();
   };
 
-  const handleStopAnswering = async (finalTranscript?: string) => {
-    if (!sttSupported || !recognitionRef.current) return;
-    
-    try {
-      recognitionRef.current.stop();
-    } catch(e) {}
-    setIsListening(false);
-    
-    const textToSubmit = finalTranscript || transcript;
-    if (textToSubmit.trim().length < 5) {
-      return;
-    }
-
-    await submitAnswerAndGetNext(textToSubmit);
-  };
-
-  // Synthetic answer execution
-  useEffect(() => {
-    if (syntheticAnswer) {
-      submitAnswerAndGetNext(syntheticAnswer);
-      setSyntheticAnswer(null);
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [syntheticAnswer]);
-
-  const submitAnswerAndGetNext = async (answerText: string) => {
-    if (!currentQuestion) return;
-
-    setIsGeneratingNext(true);
-    if (isListening && recognitionRef.current) {
-      try { recognitionRef.current.stop(); } catch(e){}
-      setIsListening(false);
-    }
-    const exchangeId = Math.random().toString(36).substring(7);
-    
-    const newExchange: QAExchange = {
-      id: exchangeId,
-      timestamp: Date.now(),
-      question: currentQuestion.question,
-      rationale: currentQuestion.rationale,
-      answer: answerText,
-      expected_points: currentQuestion.expected_points,
-    };
-
-    const newHistory = [...history, newExchange];
-    setHistory(newHistory);
-    setCurrentQuestion(null);
-    setTranscript("");
-
-    setActivityLog(prev => [...prev, { id: Date.now().toString() + Math.random(), type: 'answer', timestamp: Date.now(), content: answerText }]);
-
-    if (newHistory.length >= targetQuestions) {
-      setShowTargetReachedModal(true);
-      setIsGeneratingNext(false);
-      return;
-    }
-
-    await generateFollowUp(newHistory);
-  };
-
-  const generateFollowUp = async (currentHistory: QAExchange[]) => {
+  const generateFollowUp = async (currentHistory: QAExchange[], justSharedScreen = false) => {
     setIsGeneratingNext(true);
     try {
-      const recentContexts = screenAnalyses.slice(-4).map(s => s.visualContext).join(" | ");
+      const recentContext = latestScreenContextRef.current || "No screen content detected yet.";
       
-      const prompt = `You are an expert technical interviewer.
+      let suggestNavigation = false;
+      if (screenAnalyses.length >= 3) {
+        const last3 = screenAnalyses.slice(-3).map(s => s.visualContext);
+        if (last3[0] === last3[1] && last3[1] === last3[2]) {
+          suggestNavigation = true;
+        }
+      }
+
+      const prompt = `You are an expert technical interviewer having a real conversation.
 Project Context: ${projectContext || "Not provided."}
 
 Here is the conversation so far:
-${currentHistory.map(h => `Q: ${h.question}\nA: ${h.answer}`).join("\n\n")}
+${currentHistory.slice(-3).map(h => `Q: ${h.question}\nA: ${h.answer}`).join("\n\n")}
 
-Recent screen analysis: ${recentContexts}
+Current screen context: ${recentContext}
 
-Based on the candidate's last answer and what is currently on the screen, generate a relevant FOLLOW-UP question. 
-CRITICAL RULES:
-1. If you haven't asked to see the project yet, your next question MUST politely ask them to bring up their project on the screen.
-2. If they are already showing the project, ask a specific technical question about what is visible or what they just said.
-3. ASK ONLY ONE CLEAR AND SIMPLE QUESTION.
-4. KEEP IT EXTREMELY BRIEF (1-2 short sentences max). Do not use multiple long sentences or ramble.
-5. Be conversational but concise and easy to understand.
+Based on the candidate's last answer and the screen context, generate the NEXT question.
 
-Also provide 3-5 'expected_points' for the new question, a brief 'rationale', and an 'action'.
-Set 'action' to "wait_for_project_screen" ONLY IF your question is explicitly asking them to share or open their project screen. Otherwise set it to "none".
+CRITICAL INSTRUCTIONS:
+1. FIRST, briefly react to the candidate's previous answer in 1 short sentence (e.g. "Oh nice, using a queue for that makes sense.").
+2. THEN, ask your next technical question. 
+3. Combine your reaction and question into a SINGLE spoken response in the 'question' field.
+4. Keep your entire response brief and conversational — 2-3 sentences maximum. Real interviewers don't monologue.
+5. Vary your phrasing. Don't start every reaction with "That's interesting" or "Got it." Use natural variations ("Makes sense", "Oh I see", "Clever approach", etc.).
+${justSharedScreen ? "6. The candidate JUST started sharing their screen. Acknowledge it and ask them to walk you through what's currently visible." : "6. Ask a specific question about what is visible on the screen or what they just said."}
+${suggestNavigation ? "7. The candidate has been on the same screen for a while. explicitly ask them to navigate (e.g., 'Can you scroll down?' or 'Could you open the file where you handle X?')." : ""}
 
 Return ONLY valid JSON in this format:
 {
-  "question": "your follow-up question",
+  "question": "your brief reaction AND your next question",
   "expected_points": ["point 1", "point 2"],
-  "rationale": "reason for asking",
-  "action": "wait_for_project_screen" | "none"
+  "rationale": "reason for asking"
 }`;
 
       const data = await fetchGeminiWithRetry({ apiKey, prompt });
@@ -535,7 +606,6 @@ Return ONLY valid JSON in this format:
         const jsonStr = data.text.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
         const parsed = JSON.parse(jsonStr);
         setCurrentQuestion({ question: parsed.question, expected_points: parsed.expected_points, rationale: parsed.rationale });
-        setIsWaitingForProject(parsed.action === "wait_for_project_screen");
         speak(parsed.question);
         setActivityLog(prev => [...prev, { id: Date.now().toString() + Math.random(), type: 'question', timestamp: Date.now(), content: parsed.question }]);
       } catch (e) {
@@ -637,18 +707,27 @@ Return ONLY valid JSON in this format:
           </button>
         </div>
 
-        <button
-          onClick={tryEndInterview}
-          className="bg-destructive/10 text-destructive hover:bg-destructive/20 px-4 py-2 rounded-md text-sm font-medium transition-colors"
-        >
-          End Interview
-        </button>
+        <div className="flex items-center gap-2">
+          <button 
+            onClick={() => setShowDebug(!showDebug)}
+            className={`p-2 rounded-md transition-colors ${showDebug ? "bg-muted text-foreground" : "text-muted-foreground hover:bg-muted"}`}
+            title="Toggle Debug Panel"
+          >
+            <Bug className="w-4 h-4" />
+          </button>
+          <button
+            onClick={tryEndInterview}
+            className="bg-destructive/10 text-destructive hover:bg-destructive/20 px-4 py-2 rounded-md text-sm font-medium transition-colors"
+          >
+            End Interview
+          </button>
+        </div>
       </header>
 
       {/* Main Content */}
       <div className="flex-1 w-full max-w-7xl mx-auto flex flex-col lg:flex-row">
         {/* Main Center Area */}
-        <main className="flex-1 p-6 flex flex-col gap-8">
+        <main className="flex-1 p-6 flex flex-col gap-8 relative">
         
         {/* Error Banner */}
         {errorMsg && (
@@ -713,10 +792,23 @@ Return ONLY valid JSON in this format:
           ) : null}
         </div>
 
-        {/* Answer Capture Area */}
-        {currentQuestion && !isGeneratingNext && (
+        {/* Share Screen Button for Transition Phase */}
+        {phase === 'transition' && !isGeneratingNext && (
           <div className="flex flex-col items-center gap-6 pb-12">
-            <div className="w-full max-w-2xl bg-muted/50 rounded-lg p-6 min-h-[120px] flex flex-col border border-border">
+            <button
+              onClick={requestScreenShare}
+              className="px-8 py-4 bg-primary text-primary-foreground hover:bg-primary/90 rounded-full text-lg font-semibold flex items-center gap-3 shadow-lg transition-transform hover:scale-105"
+            >
+              <Video className="w-6 h-6" />
+              Share Screen to Continue
+            </button>
+          </div>
+        )}
+
+        {/* Answer Capture Area */}
+        {phase !== 'transition' && currentQuestion && !isGeneratingNext && (
+          <div className="flex flex-col items-center gap-6 pb-12 w-full max-w-2xl mx-auto">
+            <div className="w-full bg-muted/50 rounded-lg p-6 min-h-[120px] flex flex-col border border-border">
               {transcript ? (
                 <p className="text-lg text-foreground">{transcript}</p>
               ) : (
@@ -733,23 +825,20 @@ Return ONLY valid JSON in this format:
               )}
             </div>
 
-            <div
-              className={`
-                w-32 h-32 rounded-full flex flex-col items-center justify-center gap-2 transition-all select-none
-                ${isListening 
-                  ? transcript.trim().length > 0
-                    ? "bg-red-500 text-white shadow-[0_0_40px_rgba(239,68,68,0.5)] animate-pulse" 
-                    : "bg-red-500/90 text-white"
-                  : "bg-muted text-muted-foreground"}
-                ${!sttSupported && "opacity-50 cursor-not-allowed"}
-              `}
-            >
-              {isListening ? <Mic className="w-8 h-8" /> : <MicOff className="w-8 h-8 opacity-70" />}
-              <span className="text-[10px] font-bold text-center leading-tight">
-                {isListening 
-                  ? (transcript.trim().length > 0 ? "HEARING..." : "MIC ON\nWAITING") 
-                  : "PAUSED"}
-              </span>
+            <div className="flex items-center justify-center">
+              <div
+                className={`
+                  w-16 h-16 rounded-full flex flex-col items-center justify-center gap-1 transition-all select-none
+                  ${isListening 
+                    ? transcript.trim().length > 0
+                      ? "bg-red-500 text-white shadow-[0_0_20px_rgba(239,68,68,0.5)] animate-pulse" 
+                      : "bg-red-500/90 text-white"
+                    : "bg-muted text-muted-foreground"}
+                  ${!sttSupported && "opacity-50 cursor-not-allowed"}
+                `}
+              >
+                {isListening ? <Mic className="w-6 h-6" /> : <MicOff className="w-6 h-6 opacity-70" />}
+              </div>
             </div>
           </div>
         )}
@@ -773,6 +862,44 @@ Return ONLY valid JSON in this format:
                   </p>
                 </div>
               ))}
+            </div>
+          </div>
+        )}
+
+        {/* Debug Panel */}
+        {showDebug && (
+          <div className="absolute bottom-6 left-6 w-72 bg-black/80 backdrop-blur-md text-white border border-white/20 rounded-lg p-4 z-50 text-xs font-mono shadow-2xl">
+            <div className="flex justify-between items-center mb-2 pb-2 border-b border-white/20">
+              <span className="font-bold flex items-center gap-1.5"><Bug className="w-3.5 h-3.5 text-green-400" /> DEBUG PANEL</span>
+              <button onClick={() => setShowDebug(false)} className="text-white/50 hover:text-white">✕</button>
+            </div>
+            <div className="space-y-2">
+              <div className="flex justify-between">
+                <span className="text-white/50">Phase:</span>
+                <span className="text-blue-300">{phase}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-white/50">Listening:</span>
+                <span className={isListening ? "text-red-400 font-bold" : "text-white/50"}>{isListening ? "TRUE" : "FALSE"}</span>
+              </div>
+              <div className="flex flex-col">
+                <span className="text-white/50 mb-1">Transcript Preview:</span>
+                <span className="truncate bg-white/10 px-1.5 py-0.5 rounded text-white/80">
+                  {transcript ? `"${transcript}"` : "(empty)"}
+                </span>
+              </div>
+              <div className="flex flex-col">
+                <span className="text-white/50 mb-1 mt-1">Recent Events:</span>
+                <div className="space-y-1">
+                  {debugEvents.map((e, i) => (
+                    <div key={i} className="flex items-center gap-2 text-[10px]">
+                      <span className="text-white/30">{new Date(e.time).toLocaleTimeString()}</span>
+                      <span className="text-yellow-300">{e.event}</span>
+                    </div>
+                  ))}
+                  {debugEvents.length === 0 && <span className="text-white/30 text-[10px]">No events yet</span>}
+                </div>
+              </div>
             </div>
           </div>
         )}
@@ -806,7 +933,7 @@ Return ONLY valid JSON in this format:
       </div>
 
       {/* Floating Elements: Screen Preview & Analysis Indicator */}
-      <div className="fixed bottom-6 right-6 flex flex-col items-end gap-4 pointer-events-none">
+      <div className="fixed bottom-6 right-6 flex flex-col items-end gap-4 pointer-events-none z-40">
         
         {/* Analysis Status */}
         <div className="bg-card/90 backdrop-blur border border-border shadow-lg rounded-lg p-3 w-64 pointer-events-auto">
@@ -906,7 +1033,7 @@ Return ONLY valid JSON in this format:
               <h3 className="text-xl font-semibold tracking-tight text-foreground">Target Reached</h3>
             </div>
             <p className="text-sm text-muted-foreground">
-              You've completed the target of {targetQuestions} questions. Do you want to finish the interview and see your results, or continue for one more question?
+              You've completed the target of ${targetQuestions} questions. Do you want to finish the interview and see your results, or continue for one more question?
             </p>
             <div className="flex gap-3 flex-col mt-2">
               <button 

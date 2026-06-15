@@ -1,3 +1,5 @@
+export type InterviewPhase = 'intro' | 'transition' | 'walkthrough' | 'wrapup';
+
 export interface InterviewContext {
   projectId?: string;
   projectName?: string;
